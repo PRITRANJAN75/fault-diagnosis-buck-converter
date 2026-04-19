@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Digital Twin Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <style>
+        body {
+            background: #0f172a;
+            color: #00ffff;
+            font-family: monospace;
+        }
+
+        h2 { text-align: center; }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+            margin: 10px;
+        }
+
+        .card {
+            border: 1px solid #00ffff;
+            padding: 10px;
+            text-align: center;
+        }
+
+        #status {
+            font-size: 20px;
+            font-weight: bold;
+        }
+
+        #fault {
+            font-size: 16px;
+            font-weight: bold;
+        }
+
+        #timeline {
+            max-height: 150px;
+            overflow-y: auto;
+            text-align: left;
+        }
+
+        canvas {
+            margin-top: 20px;
+        }
+
+        button {
+            background: black;
+            color: cyan;
+            border: 1px solid cyan;
+            padding: 5px;
+        }
+    </style>
+</head>
+
+<body>
+
+<h2>⚡ DIGITAL TWIN MONITOR</h2>
+
+<div class="grid">
+    <div class="card">Vin<br><span id="vin"></span></div>
+    <div class="card">Vout<br><span id="vout"></span></div>
+    <div class="card">Iin<br><span id="iin"></span></div>
+    <div class="card">Iout<br><span id="iout"></span></div>
+
+    <div class="card">Pin<br><span id="pin"></span></div>
+    <div class="card">Pout<br><span id="pout"></span></div>
+    <div class="card">Efficiency<br><span id="eff"></span></div>
+    <div class="card">ESR<br><span id="esr"></span></div>
+</div>
+
+<!-- ✅ FIXED STATUS + FAULT DISPLAY -->
+<div class="card">
+    Status: <span id="status">--</span><br>
+    Fault: <span id="fault">--</span>
+</div>
+
+<!-- CONTROL PANEL -->
+<div class="card">
+    <button onclick="togglePause()">⏯ Pause</button>
+    <button onclick="clearCharts()">🧹 Clear</button>
+
+    Window:
+    <input type="range" min="50" max="300" value="100" id="windowSlider" onchange="updateWindow()">
+    <span id="windowValue">100</span>
+</div>
+
+<!-- FAULT TIMELINE -->
+<div class="card">
+    <b>⚠️ Fault Timeline</b>
+    <div id="timeline"></div>
+</div>
+
+<!-- CHARTS -->
+<canvas id="voltageChart"></canvas>
+<canvas id="currentChart"></canvas>
+<canvas id="esrChart"></canvas>
+
+<script>
+
+let isPaused = false;
+let MAX_POINTS = 100;
+let faultHistory = [];
+
+// 🔹 Charts
+function createChart(id, labels) {
+    return new Chart(document.getElementById(id), {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: labels.map(l => ({ label: l, data: [] }))
+        },
+        options: {
+            animation: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            }
+        }
+    });
+}
+
+const voltageChart = createChart('voltageChart', ['Vin', 'Vout']);
+const currentChart = createChart('currentChart', ['Iin', 'Iout']);
+const esrChart = createChart('esrChart', ['ESR']);
+
+// 🔹 Controls
+function togglePause() { isPaused = !isPaused; }
+
+function clearCharts() {
+    [voltageChart, currentChart, esrChart].forEach(c => {
+        c.data.labels = [];
+        c.data.datasets.forEach(d => d.data = []);
+        c.update();
+    });
+}
+
+function updateWindow() {
+    MAX_POINTS = parseInt(windowSlider.value);
+    windowValue.innerText = MAX_POINTS;
+}
+
+// 🔹 Chart Update
+function updateChart(chart, values) {
+    if (isPaused) return;
+
+    chart.data.labels.push('');
+
+    chart.data.datasets.forEach((ds, i) => {
+        ds.data.push(values[i]);
+    });
+
+    if (chart.data.labels.length > MAX_POINTS) {
+        chart.data.labels.shift();
+        chart.data.datasets.forEach(ds => ds.data.shift());
+    }
+
+    chart.update();
+}
+
+// 🔹 Fault Timeline
+function logFault(status, fault) {
+    const time = new Date().toLocaleTimeString();
+    const entry = `[${time}] ${status} | ${fault}`;
+
+    faultHistory.unshift(entry);
+    faultHistory = faultHistory.slice(0, 10);
+
+    document.getElementById("timeline").innerHTML =
+        faultHistory.map(e => `<div>${e}</div>`).join('');
+}
+
+// 🔹 Fetch Data
+async function fetchData() {
+    try {
+        const res = await fetch('http://127.0.0.1:5000/data');
+        const data = await res.json();
+
+        if (!data) return;
+
+        vin.innerText = data.Vin?.toFixed(2);
+        vout.innerText = data.Vout?.toFixed(2);
+        iin.innerText = data.Iin?.toFixed(2);
+        iout.innerText = data.Iout?.toFixed(2);
+
+        pin.innerText = data.Pin?.toFixed(2);
+        pout.innerText = data.Pout?.toFixed(2);
+        eff.innerText = data.Efficiency?.toFixed(2);
+        esr.innerText = data.ESR?.toFixed(3);
+
+        // ✅ FIXED STATUS + FAULT
+        const status = data.Status || "NORMAL";
+        const fault = data.Fault || "NORMAL";
+
+        const statusEl = document.getElementById("status");
+        const faultEl = document.getElementById("fault");
+
+        statusEl.innerText = status;
+        faultEl.innerText = fault;
+
+        // 🔥 Color logic
+        statusEl.style.color =
+            status === "FAULT" ? "red" :
+            status === "WARNING" ? "yellow" : "lime";
+
+        faultEl.style.color =
+            fault.includes("FAULT") ? "orange" : "cyan";
+
+        // 🔥 Background alert
+        document.body.style.background =
+            status === "FAULT" ? "#2a0000" :
+            status === "WARNING" ? "#2a1a00" :
+            "#0f172a";
+
+        // 🔥 Timeline
+        if (status !== "NORMAL") {
+            logFault(status, fault);
+        }
+
+        // 🔹 Charts
+        updateChart(voltageChart, [data.Vin, data.Vout]);
+        updateChart(currentChart, [data.Iin, data.Iout]);
+        updateChart(esrChart, [data.ESR]);
+
+    } catch (err) {
+        console.log("Fetch error:", err);
+    }
+}
+
+setInterval(fetchData, 200);
+
+</script>
+
+</body>
+</html>
