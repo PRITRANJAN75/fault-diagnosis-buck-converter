@@ -1,8 +1,6 @@
 from serial_reader_v2 import read_data
 from digital_twin import BuckConverterDT
-from database import insert_data
-from database import init_db
-
+from database import insert_data, init_db
 from lstm_model import load_lstm, predict_sequence
 from sequence_buffer import SequenceBuffer
 from fault_fusion import FaultFusionEngine
@@ -13,6 +11,13 @@ from collections import deque
 
 # ✅ INIT DB
 init_db()
+
+# 🔹 Fixed duty cycle
+DUTY_FIXED = 0.25
+
+# 🔹 DT warmup counter — ignore voltage_drop until DT has settled
+dt_warmup_steps = 0
+DT_WARMUP_REQUIRED = 50
 
 # 🔹 History buffer for majority voting
 pred_history = deque(maxlen=5)
@@ -65,66 +70,74 @@ try:
             pred, confidence = 0, 0.0
 
         # =========================
-        # 🔹 DIGITAL TWIN
+        # 🔹 DIGITAL TWIN — FIXED DUTY
         # =========================
-        duty = Vout / Vin if Vin > 0 else 0.5
+        duty = DUTY_FIXED
         v_virtual, _ = dt.step(Vin, duty)
 
+        dt_warmup_steps += 1
+
         error = abs(Vout - v_virtual) / max(Vout, 1)
-
-        # 🔥 LOAD sensitivity
-        if iout > 2.0:
-            error += 0.25
-
+        error *= 0.2
         error = min(error, 0.5)
 
-        # 🔥 INPUT signal
-        voltage_drop = (Vin - Vout) / max(Vin, 1)
-
-        # =========================
-        # 🔹 ESR
-        # =========================
-        if ripple_i < 1e-4:
-            esr = 0.001
+        # ✅ Suppress voltage_drop during DT warmup — DT hasn't settled yet
+        if dt_warmup_steps < DT_WARMUP_REQUIRED:
+            voltage_drop = 0.0
         else:
-            esr = (ripple_v / ripple_i) * 0.1
-
-        esr = float(np.clip(esr, 0.001, 0.5))
+            voltage_drop = abs(Vout - v_virtual) / max(v_virtual, 1)
 
         # =========================
-        # 🔥 FUSION
+        # 🔥 ESR (DISABLED FOR REAL HARDWARE)
         # =========================
-        status, trend = fusion.evaluate(esr, error, voltage_drop, pred, confidence)
+        esr = 0.02
 
         # =========================
-        # 🔥 ✅ FIXED FAULT LOGIC (CRITICAL)
+        # ✅ SANITY CHECK — Vout must be within ±15% of expected (Vin * duty)
         # =========================
-        if status == "NORMAL":
-            fault_type = "NORMAL"
+        VOUT_EXPECTED = Vin * DUTY_FIXED
+        VOUT_MIN = VOUT_EXPECTED * 0.85
+        VOUT_MAX = VOUT_EXPECTED * 1.15
+
+        if not (VOUT_MIN <= Vout <= VOUT_MAX):
+            status = "FAULT"
+            fault_type = "INPUT_FAULT"
+            trend = 0.0
+            print(
+                f"[SANITY] Vout={Vout:.2f} outside expected range "
+                f"[{VOUT_MIN:.2f}, {VOUT_MAX:.2f}] for duty={DUTY_FIXED} → INPUT_FAULT"
+            )
 
         else:
-            # 1. ESR fault (clear signature)
-            if esr > 0.05:
-                fault_type = "ESR_FAULT"
+            # =========================
+            # 🔥 FUSION — pass iout so load fault can be detected
+            # =========================
+            status, trend = fusion.evaluate(esr, error, voltage_drop, pred, confidence,iout)
 
-            # 2. LOAD fault (HIGH CURRENT)
-            elif iout > 1.5:
-                fault_type = "LOAD_FAULT"
+            # =========================
+            # 🔥 FAULT LOGIC
+            # =========================
+            if status == "NORMAL":
+                fault_type = "NORMAL"
 
-            # 3. INPUT fault (LOW INPUT VOLTAGE)
-            elif Vin < 10.0:
-                fault_type = "INPUT_FAULT"
-
-            # 4. fallback to LSTM
             else:
-                if confidence < 0.6:
-                    fault_type = "UNSURE"
-                    pred = 0
+                if iout > 5.0:
+                    fault_type = "LOAD_FAULT"
+                elif iout > 4.0:
+                    fault_type = "LOAD_FAULT"
+                elif voltage_drop > 0.25:
+                    fault_type = "INPUT_FAULT"
                 else:
-                    fault_type = fault_map.get(pred, "UNKNOWN")
+                    if confidence < 0.75:
+                        fault_type = "UNSURE"
+                        pred = 0
+                    elif error < 0.05 and voltage_drop < 0.13:
+                        fault_type = "UNSURE"
+                    else:
+                        fault_type = fault_map.get(pred, "UNKNOWN")
 
         # =========================
-        # ✅ STORE (correct place)
+        # ✅ STORE
         # =========================
         insert_data(Vin, Vout, iL, iout, ripple_v, ripple_i, status, fault_type)
 
@@ -138,7 +151,8 @@ try:
         # =========================
         print(
             f"[FUSION] Status:{status} | Fault:{fault_type} | Conf:{confidence:.2f} | "
-            f"ESR:{esr:.3f} | Error:{error:.3f} | Trend:{trend:.5f} | Vout:{Vout:.2f}"
+            f"ESR:{esr:.3f} | Error:{error:.3f} | Trend:{trend:.5f} | "
+            f"Vout:{Vout:.2f} | VDrop:{voltage_drop:.4f}"
         )
 
 except KeyboardInterrupt:
